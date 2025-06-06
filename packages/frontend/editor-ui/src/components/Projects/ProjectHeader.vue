@@ -155,7 +155,7 @@ const pageType = computed(() => {
 	}
 });
 
-const subtitle = computed(() => {
+const sectionDescription = computed(() => {
 	if (projectPages.isOverviewSubPage) {
 		return i18n.baseText('projects.header.overview.subtitle');
 	} else if (projectPages.isSharedSubPage) {
@@ -163,6 +163,16 @@ const subtitle = computed(() => {
 	} else if (isPersonalProject.value) {
 		return i18n.baseText('projects.header.personal.subtitle');
 	}
+
+	return null;
+});
+
+const projectDescriptionNonTruncatedMaxLength = 50;
+const projectDescription = computed(() => {
+	if (projectPages.isProjectsSubPage) {
+		return projectsStore.currentProject?.description;
+	}
+
 	return null;
 });
 
@@ -184,13 +194,29 @@ const onSelect = (action: string) => {
 					<N8nHeading v-if="projectName" bold tag="h2" size="xlarge" data-test-id="project-name">{{
 						projectName
 					}}</N8nHeading>
-					<N8nText color="text-light">
-						<slot name="subtitle">
-							<N8nText v-if="subtitle" color="text-light" data-test-id="project-subtitle">{{
-								subtitle
-							}}</N8nText>
-						</slot>
+					<N8nText v-if="sectionDescription" color="text-light" data-test-id="project-subtitle">
+						{{ sectionDescription }}
 					</N8nText>
+					<template v-else-if="projectDescription">
+						<N8nText
+							v-if="projectDescription.length <= projectDescriptionNonTruncatedMaxLength"
+							color="text-light"
+							data-test-id="project-subtitle"
+						>
+							{{ projectDescription }}
+						</N8nText>
+						<div v-else :class="$style.projectDescriptionWrapper">
+							<N8nTooltip :content="projectDescription" placement="bottom-end">
+								<N8nText
+									:class="$style.truncate"
+									color="text-light"
+									data-test-id="project-subtitle"
+								>
+									{{ projectDescription }}
+								</N8nText></N8nTooltip
+							>
+						</div>
+					</template>
 				</div>
 			</div>
 			<div v-if="route.name !== VIEWS.PROJECT_SETTINGS" :class="[$style.headerActions]">
@@ -225,8 +251,7 @@ const onSelect = (action: string) => {
 </template>
 
 <style lang="scss" module>
-.projectHeader,
-.projectDescription {
+.projectHeader {
 	display: flex;
 	align-items: flex-start;
 	justify-content: space-between;
@@ -241,6 +266,17 @@ const onSelect = (action: string) => {
 
 .actions {
 	padding: var(--spacing-2xs) 0 var(--spacing-xs);
+}
+
+.projectDescriptionWrapper {
+	max-width: 50vw;
+}
+
+.truncate {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
 @include mixins.breakpoint('xs-only') {
