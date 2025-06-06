@@ -1,3 +1,4 @@
+import { Logger } from '@n8n/backend-common';
 import { Config, Env } from '@n8n/config';
 import { Service } from '@n8n/di';
 import type { SSHCredentials } from 'n8n-workflow';
@@ -11,21 +12,54 @@ class SSHClientsConfig {
 	idleTimeout: number = 5 * 60;
 }
 
+type Registration = {
+	client: Client;
+
+	/**
+	 * We keep this timestamp to check if a client hasn't been used in a while,
+	 * and if it needs to be closed.
+	 */
+	lastUsed: Date;
+
+	abortController: AbortController;
+};
+
 @Service()
 export class SSHClientsManager {
-	readonly clients = new Map<string, { client: Client; lastUsed: Date }>();
+	readonly clients = new Map<string, Registration>();
 
-	constructor(private readonly config: SSHClientsConfig) {
+	readonly clientsReversed = new WeakMap<Client, string>();
+
+	private cleanupTimer: NodeJS.Timeout;
+
+	constructor(
+		private readonly config: SSHClientsConfig,
+		private readonly logger: Logger,
+	) {
 		// Close all SSH connections when the process exits
 		process.on('exit', () => this.onShutdown());
 
-		if (process.env.NODE_ENV === 'test') return;
-
 		// Regularly close stale SSH connections
-		setInterval(() => this.cleanupStaleConnections(), 60 * 1000);
+		this.cleanupTimer = setInterval(() => this.cleanupStaleConnections(), 60 * 1000);
+
+		this.logger = logger.scoped('ssh-client');
 	}
 
-	async getClient(credentials: SSHCredentials): Promise<Client> {
+	updateLastUsed(client: Client) {
+		const key = this.clientsReversed.get(client);
+
+		if (key) {
+			const registration = this.clients.get(key);
+
+			if (registration) {
+				registration.lastUsed = new Date();
+			}
+		}
+	}
+
+	async getClient(credentials: SSHCredentials, abortController?: AbortController): Promise<Client> {
+		abortController = abortController ?? new AbortController();
+
 		const { sshAuthenticateWith, sshHost, sshPort, sshUser } = credentials;
 		const sshConfig: ConnectConfig = {
 			host: sshHost,
@@ -48,24 +82,65 @@ export class SSHClientsManager {
 		}
 
 		return await new Promise((resolve, reject) => {
-			const sshClient = new Client();
+			const sshClient = this.withCleanupHandler(new Client(), abortController, clientHash);
 			sshClient.once('error', reject);
 			sshClient.once('ready', () => {
 				sshClient.off('error', reject);
-				sshClient.once('close', () => this.clients.delete(clientHash));
 				this.clients.set(clientHash, {
 					client: sshClient,
 					lastUsed: new Date(),
+					abortController,
 				});
+				this.clientsReversed.set(sshClient, clientHash);
 				resolve(sshClient);
 			});
 			sshClient.connect(sshConfig);
 		});
 	}
 
+	/**
+	 * Registers the cleanup handler for events (error, close, end) on the ssh
+	 * client and in the abort signal is received.
+	 */
+	private withCleanupHandler(sshClient: Client, abortController: AbortController, key: string) {
+		sshClient.on('error', (error) => {
+			this.logger.error('encountered error, calling cleanup', { error });
+			this.cleanupClient(key);
+		});
+		sshClient.on('end', () => {
+			this.logger.debug('socket was disconnected, calling abort signal', {});
+			this.cleanupClient(key);
+		});
+		sshClient.on('close', () => {
+			this.logger.debug('socket was closed, calling abort signal', {});
+			this.cleanupClient(key);
+		});
+		abortController.signal.addEventListener('abort', () => {
+			this.logger.debug('Got abort signal, cleaning up ssh client.', {
+				reason: abortController.signal.reason,
+			});
+			this.cleanupClient(key);
+		});
+
+		return sshClient;
+	}
+
+	private cleanupClient(key: string) {
+		const registration = this.clients.get(key);
+		if (registration) {
+			this.clients.delete(key);
+			registration.client.end();
+			if (!registration.abortController.signal.aborted) {
+				registration.abortController.abort();
+			}
+		}
+	}
+
 	onShutdown() {
-		for (const { client } of this.clients.values()) {
-			client.end();
+		this.logger.debug('Shutting down. Cleaning up all clients');
+		clearInterval(this.cleanupTimer);
+		for (const key of this.clients.keys()) {
+			this.cleanupClient(key);
 		}
 	}
 
@@ -74,10 +149,10 @@ export class SSHClientsManager {
 		if (clients.size === 0) return;
 
 		const now = Date.now();
-		for (const [hash, { client, lastUsed }] of clients.entries()) {
+		for (const [key, { lastUsed }] of clients.entries()) {
 			if (now - lastUsed.getTime() > this.config.idleTimeout * 1000) {
-				client.end();
-				clients.delete(hash);
+				this.logger.debug('Found stale client. Cleaning it up.');
+				this.cleanupClient(key);
 			}
 		}
 	}
