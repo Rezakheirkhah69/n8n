@@ -36,6 +36,7 @@ import type {
 } from 'n8n-workflow';
 import {
 	BINARY_ENCODING,
+	CHAT_TRIGGER_NODE_TYPE,
 	createDeferredPromise,
 	ExecutionCancelledError,
 	FORM_NODE_TYPE,
@@ -63,6 +64,7 @@ import { WorkflowRunner } from '@/workflow-runner';
 
 import { WebhookService } from './webhook.service';
 import type { IWebhookResponseCallbackData, WebhookRequest } from './webhook.types';
+import { ChatService } from '../chat/chat-service';
 
 /**
  * Returns all the webhooks which should be created for the given workflow
@@ -125,6 +127,15 @@ export function autoDetectResponseMode(
 				return 'formPage';
 			}
 		}
+	}
+
+	if (
+		workflowStartNode.type === CHAT_TRIGGER_NODE_TYPE &&
+		method === 'POST' &&
+		workflowStartNode.parameters.public &&
+		(workflowStartNode.parameters.options as IDataObject)?.responseMode !== 'responseNode'
+	) {
+		return 'hostedChat';
 	}
 
 	// If there are form nodes connected to a current form node we're dealing with a multipage form
@@ -404,7 +415,9 @@ export async function executeWebhook(
 		'firstEntryJson',
 	) as WebhookResponseData | string | undefined;
 
-	if (!['onReceived', 'lastNode', 'responseNode', 'formPage'].includes(responseMode)) {
+	if (
+		!['onReceived', 'lastNode', 'responseNode', 'formPage', 'hostedChat'].includes(responseMode)
+	) {
 		// If the mode is not known we error. Is probably best like that instead of using
 		// the default that people know as early as possible (probably already testing phase)
 		// that something does not resolve properly.
@@ -662,8 +675,19 @@ export async function executeWebhook(
 			responsePromise,
 		);
 
+		if (workflowStartNode.type === CHAT_TRIGGER_NODE_TYPE) {
+			const sessionId = webhookResultData.workflowData[0][0].json.sessionId as string;
+			Container.get(ChatService).updateSessionExecutionId(sessionId, executionId);
+		}
+
 		if (responseMode === 'formPage' && !didSendResponse) {
 			res.send({ formWaitingUrl: `${additionalData.formWaitingBaseUrl}/${executionId}` });
+			process.nextTick(() => res.end());
+			didSendResponse = true;
+		}
+
+		if (responseMode === 'hostedChat' && !didSendResponse) {
+			res.send({ executionStarted: true, executionId });
 			process.nextTick(() => res.end());
 			didSendResponse = true;
 		}
